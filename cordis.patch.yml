@@ -1,0 +1,32 @@
+# dsh-peak-brief — 挂载行（参考副本）
+#
+# 本文件是插件包内保留的「挂载行」参考。**真正生效的那一行**在
+#   $DSH_HOME/profiles/web/cordis.patch.yml
+# 里（profile 的用户 patch 层，profile package.json 声明了 `patchReload: live`，
+# 改完即时生效、无需重启 DSH）。
+#
+# 不要把同一条挂载线同时放进 bundle 与 patch 层：loader 会因重复 id 大声失败。
+# 本插件刻意只走 profile patch 层，以保证 Host 半身可以热重载。
+#
+# 需要手动挂载时，把下面这段拼进 profile 的 cordis.patch.yml（顶层 YAML 数组）：
+#
+#   - insert:
+#       - id: peak-brief
+#         name: 'dsh-peak-brief'
+#         config:
+#           timezone: 'Asia/Shanghai'
+#           leadMinutes: 10
+#           peakWindows:
+#             - ['09:00', '12:00']
+#             - ['14:00', '18:00']
+#           notify: 'popup'
+#           gateMode: 'hard'
+#
+# 也可以绕过 npm 安装，直接用绝对路径挂载入口文件（开发期最省事）：
+#
+#   - insert:
+#       - id: peak-brief
+#         name: 'D:/deepseekharness/tmp/dsh-peak-brief/lib/index.js'
+- insert:
+    - id: peak-brief
+      name: 'dsh-peak-brief'

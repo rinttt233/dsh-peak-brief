@@ -1,0 +1,8 @@
+# 临时探针：用绝对路径挂载本插件，验证 loader 能解析并挂载。
+# 只用于 `dsh --patch <本文件> --dump-config`，不写进 profile。
+- insert:
+    - id: peak-brief
+      name: 'D:/deepseekharness/tmp/dsh-peak-brief/lib/index.js'
+      config:
+        leadMinutes: 10
+        notify: popup
