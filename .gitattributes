@@ -1,0 +1,14 @@
+# 统一按 LF 存盘。
+#
+# 原因很具体：本机 git 是 core.autocrlf=true，而插件的 JS 是 LF。
+# 于是每次 `git add` 都会警告 "LF will be replaced by CRLF"，工作区与索引的
+# 行尾解释权在 git 配置手里 —— 对插件发布是坏消息（同一个文件在不同机器上
+# 可能得到不同字节，客户端 bundle 的 rev 是内容哈希）。
+# 这里把解释权收回仓库本身：文本一律 LF 入库、LF 检出。
+* text=auto eol=lf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.ico binary
+*.tgz binary

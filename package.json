@@ -24,6 +24,8 @@
   },
   "files": [
     "lib",
+    "scripts",
+    "data",
     "test",
     "cordis.patch.yml",
     "README.md"
@@ -32,7 +34,25 @@
     "check": "node --check lib/index.js && node --check lib/client.js",
     "test": "node --test",
     "accept": "node scripts/acceptance.mjs",
-    "build:holidays": "node scripts/build-holidays.mjs"
+    "build:holidays": "node scripts/build-holidays.mjs",
+    "verify:package": "node scripts/verify-package.mjs"
   },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "peak-hours",
+    "off-peak",
+    "scheduling"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rinttt233/dsh-peak-brief.git"
+  },
+  "homepage": "https://github.com/rinttt233/dsh-peak-brief#readme",
+  "bugs": {
+    "url": "https://github.com/rinttt233/dsh-peak-brief/issues"
+  },
+  "author": "rinttt233",
   "license": "MIT"
 }

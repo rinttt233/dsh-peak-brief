@@ -9,6 +9,7 @@
  */
 
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -45,6 +46,18 @@ for (const year of years) {
   table[year] = { holidays: pick(raw.holidays), workdays: pick(raw.workdays) }
 }
 
+/**
+ * 数据指纹：对 data/ 原始文件取 sha256，取前 12 位。
+ *
+ * 这里**故意不放生成时间**。此前头部写的是 `生成时间：<new Date().toISOString()>`，
+ * 后果是每次重跑都产生一条假的 diff —— 于是"重跑生成器再 diff"这个最自然的
+ * 漂移检查完全失效（打包体检就是在这里抓到它的）。指纹是确定性的：既记录了
+ * 这份内置表出自哪一版数据，又让重跑变成幂等操作。
+ */
+const fingerprint = createHash('sha256')
+for (const year of years) fingerprint.update(readFileSync(join(dataDir, `${year}.json`)))
+const digest = fingerprint.digest('hex').slice(0, 12)
+
 const lines = []
 lines.push('/**')
 lines.push(' * 内置兜底节假日表 —— 由 scripts/build-holidays.mjs 自动生成，请勿手改。')
@@ -53,7 +66,7 @@ lines.push(' *   holidays: 法定节假日（放假，全天闲时）')
 lines.push(' *   workdays: 调休上班日（周末被调整为工作日；按本插件规则同样全天闲时）')
 lines.push(' *')
 lines.push(` * 数据来源：chinese-days（MIT）· 覆盖年份：${years.join(', ')}`)
-lines.push(` * 生成时间：${new Date().toISOString()}`)
+lines.push(` * 数据指纹：sha256(data/*.json)[0:12] = ${digest}`)
 lines.push(' *')
 lines.push(' * 数据年份之外的日期一律走「未知年份降级」路径，绝不按错误日历执行。')
 lines.push(' */')

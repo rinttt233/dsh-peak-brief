@@ -352,6 +352,39 @@ curl 'http://127.0.0.1:3080/api/peak-brief.state?at=2026-09-17T08:50:00%2B08:00'
 > （与 `dsh-chat-forward`、`dsh-save-money` 同）。仅供本机使用。
 > 卸载插件后这些路径会回落到应用的 401 鉴权响应。
 
+## 打包与校验
+
+```sh
+npm run verify:package   # 打包体检：pack → 解包 → 在解出来的副本里跑测试与验收
+```
+
+为什么需要它：`files` 漏一个目录，**本地测试照样全绿** —— 因为本地测试读的是工作区，
+而别人装的是 tarball。这个脚本把 npm 真正会发出的东西打出来、解到临时目录，
+再在**那个副本里**跑完整测试与验收（不读工作区）。7 项检查：
+
+| # | 检查 | 为什么重要 |
+|---|---|---|
+| 1 | `npm pack` 成功 | 清单本身合法 |
+| 2 | tarball 含全部必需文件（`lib/`、`scripts/`、`data/`、`cordis.patch.yml`、`LICENSE`） | `scripts/` 与 `data/` 曾经漏掉：装完 `npm run accept` / `build:holidays` 直接不可用 |
+| 3 | 解包成功 | 归档真的能装 |
+| 4 | `lib/` 只 import 相对路径与 `node:` 内置模块 | 零依赖是硬约束（外挂插件解析不了裸模块说明符） |
+| 5 | 副本里 `node --test` 全通过 | 177/177，测的是**发出去的那份** |
+| 6 | 副本里 `npm run accept` 通过 | 8/8 验收 |
+| 7 | `scripts/build-holidays.mjs` 可重跑且产出字节不变 | **抓到过真实漂移**：头部原本写 `生成时间：<now>`，每次重跑都产生一条假 diff，"重跑再 diff"这个漂移检查因此完全失效；现已改为确定性的数据指纹 |
+
+当前 tarball：**32 个文件 / 约 111 KB**（含 `scripts/`、`data/`、`test/`）。
+
+> **`private: true` 是故意的**：它挡掉误发 npm（本插件目前只走 git 分发）。
+> 若将来要发布到 npm / 插件市场，删掉这一行即可，其余字段（`repository` /
+> `homepage` / `bugs` / `keywords` / `exports["./client"]`）都已就位。
+
+### 从 GitHub 安装
+
+```sh
+git clone https://github.com/rinttt233/dsh-peak-brief.git
+# 然后把 cordis.patch.yml 的 name 指向 clone 出来的 lib/index.js（见下一节）
+```
+
 ## 挂载
 
 `$DSH_HOME/profiles/web/cordis.patch.yml`：
