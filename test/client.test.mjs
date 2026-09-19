@@ -216,7 +216,7 @@ const SETTINGS_VALUE = {
  * @param options.withSettings - 是否提供 settingsScope（false 用于验证降级）
  * @param options.viaGet       - true 时只在 ctx.get('settingsScope') 上提供（验证回退路径）
  */
-function mount(harness, { withSettings = true, viaGet = false } = {}) {
+function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMethod = false } = {}) {
   const registrations = []
   const slots = {
     inject(name, callback) {
@@ -235,18 +235,43 @@ function mount(harness, { withSettings = true, viaGet = false } = {}) {
   const scope = makeScope(SETTINGS_VALUE)
   const bound = []
   const settingsScope = {
-    bind(spec) { bound.push(spec); return scope },
+    bind(spec) {
+      if (bindThrows === true) throw new Error('命名空间不合法')
+      bound.push(spec)
+      return scope
+    },
   }
 
+  const reachable = settingsVia === 'inject' || settingsVia === 'get'
   const ctx = {
     get(key) {
       if (key === 'slots') return slots
-      if (key === 'settingsScope' && withSettings && viaGet) return settingsScope
+      if (key === 'settingsScope' && reachable) return settingsScope
       return undefined
     },
     effect(fn) { return fn() },
   }
-  if (withSettings && viaGet !== true) ctx.settingsScope = settingsScope
+
+  // 真实 cordis：未在插件 inject 里声明的服务，**属性访问会抛**
+  // （"cannot get property … without inject"）。之前这里直接挂了个普通属性，
+  // 于是测试给了假阳性——这正是线上设置页没挂上而测试全绿的原因。
+  Object.defineProperty(ctx, 'settingsScope', {
+    get() { throw new Error('cannot get property "settingsScope" without inject') },
+    configurable: true,
+  })
+
+  if (noInjectMethod !== true) {
+    ctx.inject = (deps, callback) => {
+      if (settingsVia === 'inject' && deps.includes('settingsScope')) {
+        callback({
+          settingsScope,
+          get: ctx.get,
+          effect: ctx.effect,
+        })
+      }
+      return { dispose() {} }
+    }
+  }
 
   harness.mod.apply(ctx)
 
@@ -270,6 +295,12 @@ function mount(harness, { withSettings = true, viaGet = false } = {}) {
       return this.render(section.component, { ...props, ...extra })
     },
   }
+}
+
+/** 触发客户端为"inject 回调没来"准备的那次延迟兜底检查。 */
+function runFallbackTimers(harness) {
+  for (const timer of harness.timers.filter((t) => t.interval !== true)) timer.fn()
+  harness.timers.length = 0
 }
 
 /** 跑一遍捕获到的 effect（相当于 React 的首次提交）。 */
@@ -528,56 +559,61 @@ test('设置页：关闭按钮调用 owner 给的 close()', async () => {
   assert.equal(closed, 1)
 })
 
-test('设置页：settingsScope 不可用时不挂设置页，但浮层照常挂', () => {
+test('设置页：settingsScope 完全不可用时，浮层照常挂 + 自报原因（不再静默）', async () => {
   const harness = loadBundle()
-  const warnings = []
-  const originalWarn = console.warn
-  console.warn = (message) => warnings.push(String(message))
+  const errors = []
+  const originalError = console.error
+  console.error = (message) => errors.push(String(message))
 
   let mounted
   try {
-    mounted = mount(harness, { withSettings: false })
+    mounted = mount(harness, { settingsVia: 'none' })
+    assert.equal(mounted.registrations.length, 1, '只应挂上浮层')
+    assert.equal(mounted.registrations[0].options.name, 'shell.overlay')
+
+    // inject 回调没触发 → 跑一次延迟兜底，必须自报（console.error 仍处于接管状态）
+    runFallbackTimers(harness)
+    await flush()
   } finally {
-    console.warn = originalWarn
+    console.error = originalError
   }
 
-  assert.equal(mounted.registrations.length, 1, '只应挂上浮层')
-  assert.equal(mounted.registrations[0].options.name, 'shell.overlay')
-  assert.equal(warnings.length, 1)
-  assert.match(warnings[0], /settingsScope/)
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /设置页未挂载/)
+  const report = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.hello')
+  assert.ok(report, '必须通过自检通路把失败原因变成可见横幅')
+  assert.match(JSON.parse(report.options.body).text, /settingsScope/)
 })
 
-test('设置页：settingsScope 只通过 ctx.get 暴露时也能挂上（回退路径）', () => {
+test('设置页：只有 ctx.get 可用（无 ctx.inject）时走回退路径', () => {
   const harness = loadBundle()
-  const mounted = mount(harness, { viaGet: true })
+  const mounted = mount(harness, { settingsVia: 'get', noInjectMethod: true })
   assert.equal(mounted.registrations.length, 2)
   assert.equal(mounted.bound.length, 1)
   assert.equal(mounted.bound[0].namespace, 'peak-brief')
 })
 
-test('设置页：bind 抛错时不崩，浮层不受影响', () => {
+test('设置页：bind 抛错时自报，浮层不受影响', async () => {
   const harness = loadBundle()
-  const registrations = []
-  const slots = {
-    inject: (name, cb) => cb(),
-    register: (options, component) => { registrations.push({ options, component }); return () => {} },
-  }
-  const ctx = {
-    get: (key) => (key === 'slots' ? slots : undefined),
-    settingsScope: { bind() { throw new Error('命名空间不合法') } },
-    effect: (fn) => fn(),
-  }
-  const warnings = []
-  const originalWarn = console.warn
-  console.warn = (message) => warnings.push(String(message))
+  const errors = []
+  const originalError = console.error
+  console.error = (message) => errors.push(String(message))
+
+  let mounted
   try {
-    assert.doesNotThrow(() => harness.mod.apply(ctx))
+    mounted = mount(harness, { bindThrows: true })
   } finally {
-    console.warn = originalWarn
+    console.error = originalError
   }
-  assert.equal(registrations.length, 1)
-  assert.equal(registrations[0].options.name, 'shell.overlay')
-  assert.match(warnings[0], /绑定设置命名空间失败/)
+
+  assert.equal(mounted.registrations.length, 1)
+  assert.equal(mounted.registrations[0].options.name, 'shell.overlay')
+
+  await flush()
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /bind 失败/)
+  const report = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.hello')
+  assert.match(JSON.parse(report.options.body).text, /bind 失败/)
 })
 
 test('client：Host 没起来时两个 UI 都不崩', async () => {
