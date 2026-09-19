@@ -226,6 +226,20 @@ Client ctx.settingsScope.bind({ namespace: 'peak-brief' })
 修法：`exports.inject = ['slots']`。`settingsScope` **故意不声明**——它可能永不可用，
 硬声明会让 apply 永不执行，所以那条路继续走可选的 `ctx.inject(['settingsScope'], …)` 并自报。
 
+### 逃生按钮为什么必须在客户端（不能只靠 `/peak-allow`）
+
+拦截点在 `llm/stream` waterfall 里：**被拦的那一刻就没有模型回合了**，所以任何"要模型去执行"
+的逃生手段都可能不可用——`/peak-allow` 是 Host 的 `commands` 服务注册的斜杠命令，
+`commands` 服务本身也可能不可用（实测运行实例里就报过 `commands-service-unavailable`）。
+
+因此逃生路径必须只有 **浏览器 → HTTP** 这一条：拦截中的横幅（`notice.kind === 'peak'`
+且 `status.gate.blocking === true`）直接带一个「放行 30 分钟」按钮，POST
+`/api/peak-brief.allow`。没在拦的时候不显示这个按钮（免得把"高峰前简报"误当成拦截）。
+
+实测（运行实例）：`POST /api/peak-brief.allow {minutes:30}` → `allow.active=true`，
+`POST /api/peak-brief.allow-off` → `active=false`。另有兜底：**设置页里关掉「启用」并保存**
+同样能立刻停掉拦截，这条路也不需要模型回合。
+
 ### 诊断通道（浏览器里发生的事，后端看得见）
 
 客户端把关键结论 POST 回 `/api/peak-brief.hello`，Host 存进 `state.notice`
