@@ -631,19 +631,22 @@ test('设置页：挂载成功时也会写回诊断（后端可据此确认浏�
   const notes = diagnostics(harness)
   assert.ok(notes.some((t) => t.includes('client apply 已执行')), '第一件事就上报 apply 已执行')
   assert.ok(notes.some((t) => t.includes('已提交注册')), '提交注册要上报')
-  // 确定信号：注册回调真的跑了。真实环境里 slots.inject 是延迟执行的，
+  // 确定信号：注册回调真的跑了、登记进台账了。真实环境里 slots.inject 是延迟执行的，
   // 所以这条会在"已提交注册"之后才出现；测试里的假 slots 是同步回调，故顺序相反，
   // 这里只断言两条都存在。
   assert.ok(
-    notes.some((t) => t.includes('register 回调已执行（inject）')),
-    '必须上报"注册回调已执行"这条确定信号',
+    notes.some((t) => t.includes('settings-section 终态：') && t.includes('where=inject') && t.includes('registered=是')),
+    '必须上报"注册成功"这条确定信号',
   )
 })
 
 test('设置页：走 ctx.get 回退成功时，诊断里标明是 get 路径', () => {
   const harness = loadBundle()
   mount(harness, { settingsVia: 'get', noInjectMethod: true })
-  assert.ok(diagnostics(harness).some((t) => t.includes('register 回调已执行（get）')))
+  const notes = diagnostics(harness)
+  assert.ok(
+    notes.some((t) => t.includes('settings-section 终态：') && t.includes('where=get') && t.includes('registered=是')),
+  )
 })
 
 test('client：Host 没起来时两个 UI 都不崩', async () => {
