@@ -420,13 +420,56 @@ test('client：无通知时浮层渲染 null；有通知时渲染文案与关闭
   const textNode = nodes.find((n) => typeof n.children?.[0] === 'string' && n.children[0].includes('已被拦截'))
   assert.ok(textNode, '必须渲染出通知文案')
 
-  const button = nodes.find((n) => n.type === 'button')
+  const button = nodes.find((n) => n.type === 'button' && n.props['aria-label'] === '关闭')
   assert.ok(button)
-  assert.equal(button.props['aria-label'], '关闭')
 
   const container = nodes[0]
   assert.equal(container.props.style.pointerEvents, 'auto', '浮层穿透点击，条目必须自己打开指针事件')
   assert.equal(container.props['data-peak-brief'], 'notice')
+})
+
+test('client：真的在硬拦时，横幅上给一键放行（不依赖模型回合与斜杠命令）', async () => {
+  const harness = loadBundle()
+  const notice = { seq: 9, kind: 'peak', text: '本次模型请求已被拦截：高峰计价时段。' }
+  harness.setResponder(async () => ({
+    ok: true,
+    json: async () => ({ ok: true, state: { notice, status: { gate: { blocking: true } } } }),
+  }))
+
+  const mounted = mount(harness)
+  mounted.render(mounted.overlay.component, {})
+  runEffects(harness.hooks.effects)
+  await flush()
+
+  const nodes = collect(mounted.render(mounted.overlay.component, {}))
+  const allowButton = nodes.find((n) => n.props?.['data-peak-brief-action'] === 'allow')
+  assert.ok(allowButton, '拦截中的横幅必须有放行按钮')
+
+  allowButton.props.onClick()
+  await flush()
+
+  const allow = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.allow')
+  assert.ok(allow, '放行必须走 POST /api/peak-brief.allow')
+  assert.equal(allow.options.method, 'POST')
+  assert.equal(JSON.parse(allow.options.body).minutes, 30)
+  assert.equal(mounted.render(mounted.overlay.component, {}), null, '放行后本地先隐藏')
+})
+
+test('client：没在拦（如高峰前简报）时不显示放行按钮，免得误导', async () => {
+  const harness = loadBundle()
+  const notice = { seq: 11, kind: 'peak', text: '高峰将至：已生成恢复简报。' }
+  harness.setResponder(async () => ({
+    ok: true,
+    json: async () => ({ ok: true, state: { notice, status: { gate: { blocking: false } } } }),
+  }))
+
+  const mounted = mount(harness)
+  mounted.render(mounted.overlay.component, {})
+  runEffects(harness.hooks.effects)
+  await flush()
+
+  const nodes = collect(mounted.render(mounted.overlay.component, {}))
+  assert.equal(nodes.find((n) => n.props?.['data-peak-brief-action'] === 'allow'), undefined)
 })
 
 test('client：点关闭会 POST dismiss，并在本地先隐藏', async () => {
@@ -439,7 +482,8 @@ test('client：点关闭会 POST dismiss，并在本地先隐藏', async () => {
   runEffects(harness.hooks.effects)
   await flush()
 
-  const button = collect(mounted.render(mounted.overlay.component, {})).find((n) => n.type === 'button')
+  const button = collect(mounted.render(mounted.overlay.component, {}))
+    .find((n) => n.type === 'button' && n.props['aria-label'] === '关闭')
   button.props.onClick()
   await flush()
 
