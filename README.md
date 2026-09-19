@@ -167,17 +167,19 @@ holidayRefresh:
 | 设置页：注册 `settings.section`、渲染全部字段、保存写出正确的路径操作与 revision、非法输入不写盘、恢复默认走 `unset`、Host 拒绝时展示原因 | 同上 |
 | **设置**：手写 schema 被官方 `FileSettingsProvider` 接受（注册 / `describe()` / `toJSON()`） | `test/real-host.test.mjs`（真实 `dsh-settings-file`） |
 | **设置**：真实 `update()` 即时生效、`replace({})` 回退、非法写入被真实 provider 拒绝且不污染生效配置 | 同上 |
+| 设置页在**真实桌面版里出现**，且真的写进了 `settings.yaml` 并即时改变相位推演 | 在运行实例上实测（见「客户端半个必须声明 inject」「写入链路实测结论」） |
 | 8 条验收标准 | `npm run accept`（真实插件代码 + 时钟覆盖把一天压进几毫秒） |
 
 | **仍未验证** | 为什么 |
 |---|---|
-| 真实 `agent/created` 派发、`session.deriveMessages()`、`session.requestHeader()?.config` | 需要真实的 agent/session/goal 组合，离线搭不出来；只能读类型定义推断 |
+| 真实 `agent/created` 派发、`session.deriveMessages()`、`session.requestHeader()?.config` | 需要真实的 agent/session/goal 组合，离线搭不出来；只能读类型定义推断（`/api/peak-brief.brief` 那条路已经在真实实例上跑过一次真实模型调用） |
 | `ctx.goals.disarm()` / `resume()` 的权限策略 | 同上 |
-| Client toast 在**真实浏览器**里的观感（CSS/portal/层级） | shim 验证的是逻辑与结构，不是像素 |
-| 插件在**你这份 profile** 里加载（而不是在测试宿主里） | 源码变更不被热重载，需要一次 DSH 重启 |
+| **真的拦下一次活的会话请求** | 会把这个会话自己锁死（被拦的请求没有模型回合可用，工具也跑不了），只有重启能解；故只在 `test/real-host.test.mjs` 的真实 waterfall 上验证过 |
+| Host 半个的最新代码在你的运行实例里生效 | 桌面版只在启动时读 Host 代码；`client.js` 改完 Ctrl+R 即可，`index.js` 改完要重开 `actdsh.exe` |
+| Client toast 在真实浏览器里的观感（CSS/portal/层级） | shim 验证的是逻辑与结构，不是像素 |
 
-> 这四条是**有界的**残余风险：插件装载与核心拦截机制已经在真实运行时上跑通，
-> 剩下的是具体服务契约与浏览器渲染。
+> 残余风险是**有界的**：插件装载、设置页注册与写入、核心拦截机制都已在真实运行时上跑通，
+> 剩下的是具体服务契约（goal/agent/session）与"真拦一次活会话"这种需要你本人点头的操作。
 
 ## 设置界面
 
@@ -206,6 +208,64 @@ Client ctx.settingsScope.bind({ namespace: 'peak-brief' })
    cordis 的硬 inject 缺一个服务会让**整个插件拒绝加载**，而门控/简报/恢复都不依赖它
    （这一点是实测出来的：直接访问 `ctx.settings` 会抛
    `cannot get property "settings" without inject`）。
+
+### 客户端半个必须声明 `inject = ['slots']`（踩过的坑，附证据）
+
+设置页曾经**完全不出现**，而所有单元测试全绿。根因不在注册代码，而在**启动顺序**：
+
+```
+渲染器 apply:  new SlotRegistry(ctx).install(...)   ← `slots` 服务在这里才被提供
+我们的 apply:  在它之前跑了 → ctx.get('slots') === undefined
+                → 两处槽位注册整段被跳过（悄悄退化成 react-dom 自建容器）
+```
+
+`ctx.get(name)` 是**可选查找**（不等服务就绪）。插件 `inject` 为空时，apply 会抢在渲染器
+之前跑；这是**竞态**，所以表现时而正常、时而消失。官方插件（`settings-general` 等）
+全都声明了 `inject = ['slots', 'locale', ...]`，就是把顺序交给 cordis 而不是交给运气。
+
+修法：`exports.inject = ['slots']`。`settingsScope` **故意不声明**——它可能永不可用，
+硬声明会让 apply 永不执行，所以那条路继续走可选的 `ctx.inject(['settingsScope'], …)` 并自报。
+
+### 诊断通道（浏览器里发生的事，后端看得见）
+
+客户端把关键结论 POST 回 `/api/peak-brief.hello`，Host 存进 `state.notice`
+（`GET /api/peak-brief.state` 可读，客户端浮层也会显示）。当前会上报：
+
+| 文本 | 含义 |
+|---|---|
+| `client apply 已执行（inject=[...] slots=可用/不可用）` | bundle 真的在浏览器里跑了；同时暴露服务竞态 |
+| `settings-section: 已提交注册（…）` | 已调用 `slots.inject('settings.section', …)`（**不等于**注册成功） |
+| `settings-section 终态：where=… spec=已声明/未声明 entries=N ids=… registered=是/否` | **确定信号**：读槽位台账——我们有没有真的进 `settings.section` |
+| `settings-section 渲染报错：…` | 注册成功但组件渲染时抛错（走 `slots.onEntryError`） |
+
+`slots.inject` 的**延迟语义**很关键：槽位被声明时回调才跑，而且它抛错**不会**被外面
+`try/catch` 到（回调在声明者的 `register()` 里执行）。所以回调内部自带 `try/catch`，
+另有一个 4 秒看门狗：槽位已声明却没进去就直连重试一次，仍失败则把台账写回后端。
+
+实测确认（桌面版，运行实例）：`spec=已声明 entries=1 ids=dsh-peak-brief registered=是`。
+
+### 桌面版的刷新 / 重启边界（实测）
+
+`actdsh.exe` 是 Electron 套壳，主进程 spawn `dsh web`。因此：
+
+| 改了什么 | 生效方式 |
+|---|---|
+| `lib/client.js` | **只需 Ctrl+R**（Host 每次按内容重新提供 `/plugins` bundle，实测抓包核对过） |
+| `lib/index.js` 等 Host 半个 | 关窗（会连带 `taskkill /T` 结束整棵 dsh 进程树）后重开 `actdsh.exe` |
+| 排障 | 窗口内 **Alt** 唤出菜单栏 → View → Toggle Developer Tools；Ctrl+R 刷新 |
+
+### 写入链路实测结论
+
+设置页保存 → `settings.yaml` 落盘 → 生效配置即时改变 → **参与相位推演**：
+
+```
+改「提前量」10 → 20 并保存
+  settings.yaml:            leadMinutes: 20
+  GET /api/peak-brief.state: config.leadMinutes=20（无重启）
+  status.nextSwitch:        2026-09-21T00:50:00Z → 2026-09-21T00:40:00Z
+```
+
+最后一行是重点：提前量不是"存了个数"，它真的把下次进入 `lead` 的时刻往前挪了 10 分钟。
 
 ### 为什么 schema 是手写的
 
