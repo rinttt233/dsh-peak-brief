@@ -1,5 +1,5 @@
 # 本项目代码部分全部由AI完成
-Jvav(doge)我不会，我只会C++
+Jvavscpppt(doge)我不会，我只会C++
 
 # dsh-peak-brief
 
