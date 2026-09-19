@@ -215,8 +215,10 @@ const SETTINGS_VALUE = {
  * 装载模块并注册槽位。
  * @param options.withSettings - 是否提供 settingsScope（false 用于验证降级）
  * @param options.viaGet       - true 时只在 ctx.get('settingsScope') 上提供（验证回退路径）
+ * @param options.slotsLate    - true 时一开始拿不到 slots（复现"服务注册竞态"），
+ *                               需手动调用返回的 releaseSlots() 让它到位
  */
-function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMethod = false } = {}) {
+function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMethod = false, slotsLate = false } = {}) {
   const registrations = []
   const slots = {
     inject(name, callback) {
@@ -243,9 +245,10 @@ function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMe
   }
 
   const reachable = settingsVia === 'inject' || settingsVia === 'get'
+  let slotsReady = slotsLate !== true
   const ctx = {
     get(key) {
-      if (key === 'slots') return slots
+      if (key === 'slots') return slotsReady ? slots : undefined
       if (key === 'settingsScope' && reachable) return settingsScope
       return undefined
     },
@@ -284,6 +287,8 @@ function mount(harness, { settingsVia = 'inject', bindThrows = false, noInjectMe
     section,
     scope,
     bound,
+    /** 让迟到的 slots 到位（配合 slotsLate 使用）。 */
+    releaseSlots() { slotsReady = true },
     /** 渲染任意注册组件；`extra` 会合进 props（settings.section 的 owner 会传 close）。 */
     render(component, extra = {}) {
       harness.hooks.reset()
@@ -350,8 +355,10 @@ test('client：factory 只请求平台 seed 模块（无构建产物依赖）', 
   const { mod, requested } = loadBundle()
   assert.deepEqual([...new Set(requested)].sort(), ['react', 'react-dom'])
   assert.equal(mod.name, 'dsh-peak-brief')
-  // vm 里造出来的数组原型与宿主 realm 不同，不能用 deepStrictEqual
-  assert.equal(mod.inject.length, 0)
+  // 回归护栏：inject 为空会让 apply 抢在渲染器提供 slots 服务之前跑，
+  // 实测后果是 `client apply 已执行（slots=不可用）`，两处槽位注册整段被跳过。
+  // vm 里造出来的数组原型与宿主 realm 不同，先拷回宿主数组再比。
+  assert.deepEqual([...mod.inject].sort(), ['slots'])
   assert.equal(typeof mod.apply, 'function')
 })
 
@@ -371,6 +378,29 @@ test('client：两处槽位都注册（浮层 + 设置页），不会注册完�
   assert.equal(typeof mounted.section.component, 'function')
   assert.equal(mounted.bound.length, 1)
   assert.equal(mounted.bound[0].namespace, 'peak-brief', '必须绑定 Host 的 peak-brief 命名空间')
+})
+
+test('client：slots 迟到（服务注册竞态）时轮询补挂，而不是整段跳过', () => {
+  // 线上实测：插件 inject 为空时 apply 会抢在渲染器 `new SlotRegistry(ctx)` 之前跑，
+  // 那一刻 ctx.get('slots') 是 undefined，于是设置页注册整段消失。
+  const harness = loadBundle()
+  const mounted = mount(harness, { slotsLate: true })
+
+  assert.equal(mounted.registrations.length, 0, 'slots 不可用时不该假装挂上')
+  assert.match(lastDiagnostic(harness), /slots=不可用/)
+
+  const tick = harness.timers.find((t) => t.interval === true)
+  assert.ok(tick, 'slots 拿不到时必须排一个轮询定时器，而不是直接放弃')
+
+  mounted.releaseSlots()
+  tick.fn()
+
+  assert.deepEqual(
+    mounted.registrations.map((r) => r.options.name).sort(),
+    ['settings.section', 'shell.overlay'],
+    'slots 到位后两处槽位都要补挂上',
+  )
+  assert.ok(diagnostics(harness).some((t) => t.includes('slots 迟到')), '补挂要如实上报')
 })
 
 test('client：无通知时浮层渲染 null；有通知时渲染文案与关闭按钮', async () => {
