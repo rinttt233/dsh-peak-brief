@@ -303,6 +303,16 @@ function runFallbackTimers(harness) {
   harness.timers.length = 0
 }
 
+/** 客户端写回 Host 的全部诊断文本（走 /api/peak-brief.hello）。 */
+function diagnostics(harness) {
+  return harness.fetchCalls
+    .filter((c) => c.url === '/api/peak-brief.hello')
+    .map((c) => JSON.parse(c.options.body).text)
+}
+
+/** 最后一条诊断（成功/失败结论总是最后上报的那条）。 */
+const lastDiagnostic = (harness) => diagnostics(harness).at(-1) ?? ''
+
 /** 跑一遍捕获到的 effect（相当于 React 的首次提交）。 */
 function runEffects(effects) {
   const cleanups = []
@@ -580,9 +590,7 @@ test('设置页：settingsScope 完全不可用时，浮层照常挂 + 自报原
 
   assert.equal(errors.length, 1)
   assert.match(errors[0], /设置页未挂载/)
-  const report = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.hello')
-  assert.ok(report, '必须通过自检通路把失败原因变成可见横幅')
-  assert.match(JSON.parse(report.options.body).text, /settingsScope/)
+  assert.match(lastDiagnostic(harness), /settingsScope/, '必须把确切原因写回 Host 供后端读取')
 })
 
 test('设置页：只有 ctx.get 可用（无 ctx.inject）时走回退路径', () => {
@@ -612,8 +620,23 @@ test('设置页：bind 抛错时自报，浮层不受影响', async () => {
   await flush()
   assert.equal(errors.length, 1)
   assert.match(errors[0], /bind 失败/)
-  const report = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.hello')
-  assert.match(JSON.parse(report.options.body).text, /bind 失败/)
+  assert.match(lastDiagnostic(harness), /bind 失败/)
+})
+
+test('设置页：挂载成功时也会写回诊断（后端可据此确认浏览器真的挂上了）', () => {
+  const harness = loadBundle()
+  const mounted = mount(harness)
+  assert.equal(mounted.registrations.length, 2)
+
+  const notes = diagnostics(harness)
+  assert.ok(notes.some((t) => t.includes('client apply 已执行')), '第一件事就上报 apply 已执行')
+  assert.match(lastDiagnostic(harness), /settings-section: 已注册/)
+})
+
+test('设置页：走 ctx.get 回退成功时，诊断里标明是 get 路径', () => {
+  const harness = loadBundle()
+  mount(harness, { settingsVia: 'get', noInjectMethod: true })
+  assert.match(lastDiagnostic(harness), /已注册（get）/)
 })
 
 test('client：Host 没起来时两个 UI 都不崩', async () => {
