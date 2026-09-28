@@ -208,6 +208,7 @@ const SETTINGS_VALUE = {
   notify: 'popup',
   gateMode: 'hard',
   blockAuxiliary: true,
+  resumeBlocked: true,
   overrides: { '2027-01-01': 'off' },
 }
 
@@ -494,6 +495,48 @@ test('client：点关闭会 POST dismiss，并在本地先隐藏', async () => {
   assert.equal(mounted.render(mounted.overlay.component, {}), null, '关闭后必须立刻不再渲染')
 })
 
+test('client：有请求正等谷期时，横幅给「取消推迟」并 POST 到 cancel-queue', async () => {
+  const harness = loadBundle()
+  const notice = { seq: 13, kind: 'peak', text: '已推迟到谷期自动重发。' }
+  harness.setResponder(async () => ({
+    ok: true,
+    json: async () => ({ ok: true, state: { notice, status: { gate: { blocking: true }, queue: { count: 1 } } } }),
+  }))
+
+  const mounted = mount(harness)
+  mounted.render(mounted.overlay.component, {})
+  runEffects(harness.hooks.effects)
+  await flush()
+
+  const cancel = collect(mounted.render(mounted.overlay.component, {}))
+    .find((n) => n.props?.['data-peak-brief-action'] === 'cancel-queue')
+  assert.ok(cancel, '有请求在等谷期时必须给「取消推迟」')
+
+  cancel.props.onClick()
+  await flush()
+  const posted = harness.fetchCalls.find((c) => c.url === '/api/peak-brief.cancel-queue')
+  assert.ok(posted, '取消推迟必须走 POST /api/peak-brief.cancel-queue')
+  assert.equal(posted.options.method, 'POST')
+})
+
+test('client：没有请求在等谷期时不给「取消推迟」（免得误导）', async () => {
+  const harness = loadBundle()
+  const notice = { seq: 14, kind: 'peak', text: '本次模型请求已被拦截。' }
+  harness.setResponder(async () => ({
+    ok: true,
+    json: async () => ({ ok: true, state: { notice, status: { gate: { blocking: true }, queue: { count: 0 } } } }),
+  }))
+
+  const mounted = mount(harness)
+  mounted.render(mounted.overlay.component, {})
+  runEffects(harness.hooks.effects)
+  await flush()
+
+  const nodes = collect(mounted.render(mounted.overlay.component, {}))
+  assert.equal(nodes.find((n) => n.props?.['data-peak-brief-action'] === 'cancel-queue'), undefined)
+  assert.ok(nodes.find((n) => n.props?.['data-peak-brief-action'] === 'allow'), '该有的放行按钮还在')
+})
+
 test('client：React 不可用时降级为"只报错、不崩"', () => {
   const harness = loadBundle({ requireOverrides: { react: new Error('没有 react') } })
   const errors = []
@@ -516,7 +559,7 @@ test('设置页：渲染出全部字段与当前值', async () => {
   const tree = mounted.renderSettings()
 
   const text = textOf(tree)
-  for (const label of ['启用峰谷调度', '提前量（分钟）', '时区', '高峰时段', '高峰拦截', '连辅助请求一起拦', '提示方式', '按日手动覆盖']) {
+  for (const label of ['启用峰谷调度', '提前量（分钟）', '时区', '高峰时段', '高峰拦截', '连辅助请求一起拦', '被拦对话在谷期自动续跑', '提示方式', '按日手动覆盖']) {
     assert.ok(text.includes(label), `缺少字段：${label}`)
   }
 
@@ -526,6 +569,7 @@ test('设置页：渲染出全部字段与当前值', async () => {
   assert.equal(byField(tree, 'gateMode').props.value, 'hard')
   assert.equal(byField(tree, 'notify').props.value, 'popup')
   assert.equal(byField(tree, 'blockAuxiliary').props.checked, true)
+  assert.equal(byField(tree, 'resumeBlocked').props.checked, true, 'P6：谷期自动续跑的开关要在设置页里')
   assert.equal(byField(tree, 'peakWindows').props.value, '09:00-12:00\n14:00-18:00')
   assert.equal(JSON.parse(byField(tree, 'overrides').props.value)['2027-01-01'], 'off')
 

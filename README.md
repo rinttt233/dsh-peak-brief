@@ -3,9 +3,9 @@ Jvavscpppt(doge)我不会，我只会C++
 
 # dsh-peak-brief
 
-DSH（DeepSeek Harness）峰谷调度插件：**高峰前 N 分钟自动生成"仅供 AI 恢复用"的简报并停掉自动续跑，高峰期间硬拦模型请求（带逃生），闲时自动注入简报继续任务。**
+DSH（DeepSeek Harness）峰谷调度插件：**高峰前 N 分钟自动生成"仅供 AI 恢复用"的简报并停掉自动续跑，高峰期间硬拦模型请求（被拦的对话在谷期原地自动重发，带一键放行/取消），闲时自动注入简报继续任务。**
 
-> 当前状态：**P0–P5 + 设置界面**。`npm run accept` 的 8 条验收标准 **8/8 通过**；
+> 当前状态：**P0–P6 + 设置界面**。`npm run accept` 的 9 条验收标准 **9/9 通过**；
 > 另有两组"真实宿主"测试：用 DSH 运行时里真实的 `@deepseek-ai/cordis` +
 > 真实 `LlmRuntime` + 真实 `dsh-settings-file` 装载本插件。
 > 门控默认 `enabled: false`，所以**挂载它本身不会拦截任何请求、不排任何定时器**。
@@ -126,6 +126,68 @@ DeepSeek 官方 API 在高峰时段按 2 倍计价（北京时间工作日 `09:0
 （默认 12 小时）的旧简报不认领；恢复的目标只在"确实是我们 disarm 过、且它原本 armed"
 时才重新武装。
 
+## 被拦的对话在谷期原地重发（P6）
+
+前面那套是"**高峰前**把活交接清楚"；这一节补的是另一半：**你真的在高峰里发了一条消息**，
+怎么办。
+
+默认行为（`resumeBlocked: true`）：请求**不以错误结束**，而是停在那里等，进入谷期
+（或你点「立即放行」）后**重发同一个请求**——对话原地接上。
+
+### 为什么能"原地"接上（这是官方留的正门，不是 hack）
+
+`dsh-agent-loop` 消费到终止 finish 后会走一条被 `await` 的 waterfall：
+
+```js
+// node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js:1081-1098
+if (finish.kind === "error" || finish.kind === "aborted") {
+  const action = await this.dispatch.waterfall("agent/request-error", { …, failure: finish.failure, signal }, () => Promise.resolve(undefined));
+  signal.throwIfAborted();
+  if (action?.kind !== "retry") throw new LlmError(…);
+  continue;                     // ← 重发同一个请求
+}
+```
+
+监听器返回 `{ kind: 'retry' }` 就重发，而此时 loop 的 `firstAttempt` 已经是 `false`，
+**不会重复写用户消息**。所以本插件只是"把 promise 挂到谷期再返回 retry"：
+
+- 用户那条消息**只有一条**，不需要注入"继续"这种合成提示词；
+- 空等期间轮次保持打开，loop 的重试、取消、持久化语义都照常。
+
+第一方插件 `dsh-llm-retry` 用同一条通道做退避重试（也是"合并 AbortSignal → 持久记录 →
+可取消等待 → 返回 retry"）。它默认 `normal` 模式、`PEAK_BRIEF_BLOCKED` 不在它的
+`retryableCodes` 里，于是它 `return next()` 把决定权交给下游（也就是我们），**不打架**。
+
+### 五种结算方式（一个都不能少）
+
+| 触发 | 结果 | 落盘兜底记录 |
+|---|---|---|
+| 进入谷期 / 闸门不再拦 | 返回 `{ kind: 'retry' }` → **原地重发** | 删除（已经自己续上了） |
+| 用户点「立即放行」 | 同上（立刻重发） | 删除 |
+| 用户点「取消推迟」 | 以 `PEAK_BRIEF_BLOCKED` 结束 | 删除（用户放弃了，重启后不该再续） |
+| 用户按"停止"（turn signal abort） | 立刻结束 | 删除 |
+| 插件卸载 / 进程没了 | 立刻结算等待 | **保留** → 重启对账在谷期用既有链路接回 |
+| 等过"本段高峰结束 + 60 秒"仍在拦 | 结束（防御性，正常到不了） | 保留 |
+
+### 两个容易写错的地方（都踩过，已由测试钉住）
+
+1. **判定"还拦不拦"不能用 `gate.decide()`**：它会累加 `blockedCount`。每 5 秒轮询一次的话，
+   一次真实拦截会被记成几百次。所以另有一个纯函数 `gate.wouldBlock()`，
+   并由 `test/gate.test.mjs` 的矩阵断言守着它与 `decide().block` 永远一致。
+2. **结算顺序必须是"先看还拦不拦，再看超时"**。反过来的话，时钟一推过高峰结束就会被判成
+   "等待超时"，本该重发的请求变成了失败——写验收标准 9 时就是这么红的。
+
+还有一条**避免续跑两次**：park 判为 `allowed` 时会把该会话的周期记录清掉。否则
+（尤其是 agent 被重建过、重启对账已经按落盘文件认领了一份简报的情况）同一个会话会
+既原地重发、又被注入一次简报 + followup。
+
+### 范围与开关
+
+- **只 park 普通对话请求**。辅助调用（`session-title` / `compaction`）继续"拦下即失败"——
+  把起标题挂 3 小时没有意义；
+- 设置页里「**被拦对话在谷期自动续跑**」可以关掉，关掉即回到 P2 行为（拦下就报错结束）；
+- `status.queue` 暴露排队中的会话与最近的结算记录，用于取证。
+
 ## 斜杠命令
 
 由 `ctx.commands.register` 注册（**不放进 `inject`**：inject 里缺一个服务会让整个插件
@@ -170,8 +232,10 @@ holidayRefresh:
 | 设置页：注册 `settings.section`、渲染全部字段、保存写出正确的路径操作与 revision、非法输入不写盘、恢复默认走 `unset`、Host 拒绝时展示原因 | 同上 |
 | **设置**：手写 schema 被官方 `FileSettingsProvider` 接受（注册 / `describe()` / `toJSON()`） | `test/real-host.test.mjs`（真实 `dsh-settings-file`） |
 | **设置**：真实 `update()` 即时生效、`replace({})` 回退、非法写入被真实 provider 拒绝且不污染生效配置 | 同上 |
+| **P6**：真实 cordis 的 `agent/request-error` waterfall 上，被拦请求 park 住 → 谷期返回 `{ kind: 'retry' }` → 重发的请求真的抵达适配器 | `test/real-host.test.mjs`（真 `Context` + 真 `LlmRuntime`） |
+| **P6**：五种结算（谷期/放行/取消/abort/卸载）、辅助请求不 park、关掉开关回到 P2、重启兜底被对账认领 | `test/host.integration.test.mjs` + `npm run accept` 标准 9 |
 | 设置页在**真实桌面版里出现**，且真的写进了 `settings.yaml` 并即时改变相位推演 | 在运行实例上实测（见「客户端半个必须声明 inject」「写入链路实测结论」） |
-| 8 条验收标准 | `npm run accept`（真实插件代码 + 时钟覆盖把一天压进几毫秒） |
+| 9 条验收标准 | `npm run accept`（真实插件代码 + 时钟覆盖把一天压进几毫秒） |
 
 | **仍未验证** | 为什么 |
 |---|---|
@@ -187,8 +251,8 @@ holidayRefresh:
 ## 设置界面
 
 「**设置 → 峰谷调度**」是一整页配置界面，可改：启用开关、提前量、时区、高峰时段、
-高峰拦截模式、是否连辅助请求一起拦、提示方式、按日手动覆盖。另有"保存 / 恢复默认 /
-关闭"与一条实时运行状态（当前相位、下次切换、已拦截次数）。
+高峰拦截模式、是否连辅助请求一起拦、**被拦对话是否在谷期自动续跑**、提示方式、按日手动覆盖。
+另有"保存 / 恢复默认 / 关闭"与一条实时运行状态（当前相位、下次切换、已拦截次数）。
 
 **数据流**（Host 与 Client 各一半，都不自己存配置）：
 
@@ -307,7 +371,7 @@ dsh-peak-brief/
   cordis.patch.yml          挂载行参考（真正生效的在 profile 的 patch 层）
   data/2025.json 2026.json  节假日原始数据（来源可追溯）
   scripts/build-holidays.mjs  由 data/ 生成 lib/holidays.js
-  scripts/acceptance.mjs      8 条验收标准的离线推演报告
+  scripts/acceptance.mjs      9 条验收标准的离线推演报告
   test/real-host.test.mjs     真实 cordis + 真实 LlmRuntime + 真实 dsh-settings-file
   test/client.test.mjs        Client 半身：vm + React shim 真实执行并展开组件树
   lib/holidays.js           内置兜底表（自动生成，勿手改）
@@ -338,8 +402,9 @@ dsh-peak-brief/
 | 路由 | 方法 | 说明 |
 |---|---|---|
 | `/api/peak-brief.state` | GET | 插件状态 + 完整相位判定 + 门控状态；`?at=<RFC3339>` 可查询任意瞬间 |
-| `/api/peak-brief.allow` | POST | **逃生**：`{ minutes?, note? }` 本次放行（缺省 30 分钟，且不超过本段高峰结束） |
+| `/api/peak-brief.allow` | POST | **逃生**：`{ minutes?, note? }` 本次放行（缺省 30 分钟，且不超过本段高峰结束）；顺手把等谷期的 park 结算成"立刻重发" |
 | `/api/peak-brief.allow-off` | POST | 立刻关闭逃生窗口，恢复拦截 |
+| `/api/peak-brief.cancel-queue` | POST | **取消推迟**：`{ sessionId? }` 让等谷期的请求按拦截结束（省略则取消全部） |
 | `/api/peak-brief.brief` | POST | **生成简报**：`{ sessionId? }`（只有一个活会话时可省略）；落盘并返回简报 |
 | `/api/peak-brief.debug-tick` | POST | **推进一次周期检查**：`{ at? }` 可先把时钟覆盖到某个瞬间，用于不等真时间就能推演 |
 | `/api/peak-brief.debug-clock` | POST | 装 / 卸时钟覆盖：`{ at }` 装入，`{ clear: true }` 卸下（默认不覆盖） |
@@ -372,7 +437,7 @@ npm run verify:package   # 打包体检：pack → 解包 → 在解出来的副
 | 3 | 解包成功 | 归档真的能装 |
 | 4 | `lib/` 只 import 相对路径与 `node:` 内置模块 | 零依赖是硬约束（外挂插件解析不了裸模块说明符） |
 | 5 | 副本里 `node --test` 全通过 | 177/177，测的是**发出去的那份** |
-| 6 | 副本里 `npm run accept` 通过 | 8/8 验收 |
+| 6 | 副本里 `npm run accept` 通过 | 9/9 验收 |
 | 7 | `scripts/build-holidays.mjs` 可重跑且产出字节不变 | **抓到过真实漂移**：头部原本写 `生成时间：<now>`，每次重跑都产生一条假 diff，"重跑再 diff"这个漂移检查因此完全失效；现已改为确定性的数据指纹 |
 
 当前 tarball：**32 个文件 / 约 111 KB**（含 `scripts/`、`data/`、`test/`）。
@@ -410,7 +475,7 @@ git clone https://github.com/rinttt233/dsh-peak-brief.git
 ```sh
 node --check lib/*.js     # 语法
 node --test               # 全部测试（单测 + Host 集成 + 烟测）
-npm run accept            # 8 条验收标准的离线推演报告（不需要等到明早 8:50）
+npm run accept            # 9 条验收标准的离线推演报告（不需要等到明早 8:50）
 
 # 非侵入式挂载校验（不碰正在用的 profile）
 dsh --profile web --patch test/patch.probe.yml --dump-config
@@ -440,10 +505,15 @@ dsh --profile web --patch test/patch.probe.yml --dump-config
 - [x] **P2** `gate`：`llm/stream` 硬拦 + `/peak-allow` 逃生窗口
 - [x] **P3** `brief`：`ctx.llm.stream` 生成结构化简报并落盘
 - [x] **P4** `resume`：周期调度 + `inject`/`followup` + 目标 `disarm`/`resume` + 删文件 + 重启对账
-- [x] **P5** 端到端：`npm run accept` 离线推演 8/8 通过（含斜杠命令逃生）
-- [x] **真实宿主验证**：真实 cordis + 真实 LlmRuntime 装载与拦截
+- [x] **P5** 端到端：`npm run accept` 离线推演 9/9 通过（含斜杠命令逃生）
+- [x] **P6** 被拦对话在谷期原地重发：`agent/request-error` + `{ kind: 'retry' }`、
+  落盘兜底 + 重启对账、横幅「立即放行 / 取消推迟」
+- [x] **真实宿主验证**：真实 cordis + 真实 LlmRuntime 装载、拦截，以及真实
+  `agent/request-error` waterfall 上的 park → 谷期 retry → 重发抵达适配器
 - [ ] **线上验收**：需要一次 DSH 重启（源码变更不被热重载）
 - [ ] **P5** 端到端（`debug-tick` 推演工作日 / 调休日 / 法定节假日）
+- [ ] **P6 活会话验收**：用调试时钟在**真实 agent loop** 上推完"高峰被拦 → 推进过高峰 →
+  自动重发"（离线部分已用真 cordis waterfall 覆盖；差的是 UI 面对"轮次打开 3 小时"的表现）
 
 ## 已知限制（不修，只记录）
 

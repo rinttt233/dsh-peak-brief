@@ -1,5 +1,5 @@
 /**
- * dsh-peak-brief 验收脚本 —— 对着**真实的** lib/index.js 逐条核验 8 条验收标准。
+ * dsh-peak-brief 验收脚本 —— 对着**真实的** lib/index.js 逐条核验 9 条验收标准。
  *
  * 完全离线：用假 ctx / 假 agent / 假 llm 驱动真实插件代码，并用插件自带的
  * 时钟覆盖（debug-clock）把一整天压缩进几毫秒——不必等到明早 8:50。
@@ -406,6 +406,63 @@ await criterion(8, '重启后对账：不会卡在暂停，也不会把过期任
     rmSync(staleDir, { recursive: true, force: true })
   } finally {
     rmSync(recoverDir, { recursive: true, force: true })
+  }
+})
+
+// ---- 标准 9 ----
+await criterion(9, '高峰拦下的对话请求在谷期原地重发（不重复用户消息）', async (note) => {
+  const parkDir = mkdtempSync(join(tmpdir(), 'acc-park-'))
+  try {
+    const { routes, listeners } = boot({ ...PEAK_CONFIG, brief: { dir: parkDir } }, { llm: fakeLlm(BRIEF_OK) })
+
+    // 时钟放进高峰，拦下一次带 sessionId 的普通对话请求
+    await call(routes, '/api/peak-brief.debug-clock', { method: 'POST', body: { at: B('10:00:00') } })
+    const streamListener = (listeners.get('llm/stream') ?? [])[0]
+    const options = {
+      provider: 'p',
+      model: 'm',
+      sessionId: 'acc-9',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '把这件事做完' }] }],
+    }
+    let downCalls = 0
+    const downstream = () => {
+      downCalls += 1
+      return (async function* ok() { yield { type: 'finish', reason: { kind: 'stop' } } })()
+    }
+    const first = []
+    for await (const chunk of streamListener(options, downstream)) first.push(chunk)
+    assert.equal(downCalls, 0, '高峰必须拦下')
+    assert.equal(first.at(-1).reason.failure.code, GATE_CODE)
+
+    const queued = (await call(routes, '/api/peak-brief.state')).json.state.status.queue
+    assert.equal(queued.count, 1, '必须进 park 队列而不是直接失败')
+
+    // 官方正门：agent/request-error 里我们接管，等待期间不结算
+    const handler = (listeners.get('agent/request-error') ?? [])[0]
+    assert.ok(handler, 'agent/request-error 监听器未注册')
+    const decision = handler(
+      { agent: { session: { id: 'acc-9' } }, failure: { code: GATE_CODE, message: '高峰' } },
+      () => Promise.resolve('downstream'),
+    )
+    let settled = false
+    decision.then(() => { settled = true })
+    await new Promise((resolve) => { setTimeout(resolve, 20) })
+    assert.equal(settled, false, '没到谷期必须挂着')
+
+    // 谷期一到 → retry → 重发真的打到下游
+    await call(routes, '/api/peak-brief.debug-clock', { method: 'POST', body: { at: B('12:30:00') } })
+    assert.deepEqual(await decision, { kind: 'retry' })
+    const second = []
+    for await (const chunk of streamListener(options, downstream)) second.push(chunk)
+    assert.equal(downCalls, 1, '谷期的重发必须真的走到下游')
+    assert.equal(second.at(-1).reason.kind, 'stop')
+
+    const after = (await call(routes, '/api/peak-brief.state')).json.state.status.queue
+    assert.equal(after.count, 0, '重发后队列清空')
+    assert.equal(after.recent.at(-1).outcome, 'allowed')
+    note('10:00 拦下 → park 住不结算 → 12:30 返回 retry → 重发抵达下游；不做任何用户消息重放')
+  } finally {
+    rmSync(parkDir, { recursive: true, force: true })
   }
 })
 

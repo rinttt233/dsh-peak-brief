@@ -22,6 +22,7 @@ test('空输入解析成默认值', () => {
   assert.deepEqual(config, DEFAULT_CONFIG)
   assert.deepEqual(config.peakWindows, [['09:00', '12:00'], ['14:00', '18:00']])
   assert.equal(config.enabled, false, '默认必须是关闭的：挂载插件本身不该开始拦截')
+  assert.equal(config.resumeBlocked, true, 'P6：默认在谷期原地重发被拦的对话请求')
 })
 
 test('解析是幂等的（设置文档不会因为反复解析而漂移）', () => {
@@ -38,6 +39,7 @@ test('非法值一律抛错 —— 这正是"非法配置存不进去"的结构�
   assert.throws(() => normalizeConfig({ leadMinutes: '10' }), /leadMinutes/)
   assert.throws(() => normalizeConfig({ enabled: 'yes' }), /enabled/)
   assert.throws(() => normalizeConfig({ blockAuxiliary: 1 }), /blockAuxiliary/)
+  assert.throws(() => normalizeConfig({ resumeBlocked: 'yes' }), /resumeBlocked/)
   assert.throws(() => normalizeConfig({ gateMode: '随便' }), /gateMode/)
   assert.throws(() => normalizeConfig({ notify: 'sms' }), /notify/)
   assert.throws(() => normalizeConfig({ peakWindows: [['09:00', '12:00'], ['11:00', '13:00']] }), /重叠/)

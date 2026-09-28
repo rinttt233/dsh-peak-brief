@@ -33,6 +33,44 @@ test('createGate 需要 windows', () => {
   assert.throws(() => createGate({ config: {} }), /需要 windows/)
 })
 
+test('wouldBlock 与 decide().block 在整张状态矩阵上一致（两份规则不许漂移）', () => {
+  // wouldBlock 是给"等谷期"每几秒轮询用的纯判定；decide 是真正的拦截判定。
+  // 两者若漂移，等待就会和门控说不同的话——用矩阵把等价性钉住。
+  const cases = [
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: PEAK, options: {} },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: PEAK, options: { purpose: 'session-title' } },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: false }, at: PEAK, options: { purpose: 'compaction' } },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: LEAD, options: {} },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: OFF, options: {} },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: HOLIDAY, options: {} },
+    { config: { enabled: false, gateMode: 'hard', blockAuxiliary: true }, at: PEAK, options: {} },
+    { config: { enabled: true, gateMode: 'off', blockAuxiliary: true }, at: PEAK, options: {} },
+    { config: { enabled: true, gateMode: 'hard', blockAuxiliary: true }, at: PEAK, options: {}, allow: 30 },
+  ]
+  for (const item of cases) {
+    const gate = makeGate(item.config)
+    if (item.allow !== undefined) gate.allowFor(item.allow, item.at, 'test')
+    assert.equal(
+      gate.wouldBlock(item.at, item.options),
+      gate.decide(item.at, item.options).block === true,
+      `不一致：${JSON.stringify(item)}`,
+    )
+  }
+})
+
+test('wouldBlock 没有副作用：反复问不会污染拦截统计', () => {
+  const gate = makeGate()
+  for (let i = 0; i < 50; i += 1) assert.equal(gate.wouldBlock(PEAK, {}), true)
+
+  const clean = gate.snapshot(PEAK)
+  assert.equal(clean.blockedCount, 0, '纯判定不该累加 blockedCount')
+  assert.equal(clean.lastBlockedAt, null, '纯判定不该刷新最后拦截时间')
+
+  gate.decide(PEAK, {})
+  const after = gate.snapshot(PEAK)
+  assert.equal(after.blockedCount, 1, '真正的拦截才计数')
+})
+
 test('默认关闭时一律放行', () => {
   const gate = makeGate({ enabled: false })
   for (const at of [PEAK, LEAD, OFF, HOLIDAY]) {

@@ -93,7 +93,34 @@ async function statusAt(routes, localIso) {
 function boot(config = {}, services = {}) {
   const { ctx, routes, listeners, logs, effectDisposers } = makeCtx(services)
   apply(ctx, config)
-  return { routes, listeners, logs, effectDisposers }
+  return { ctx, routes, listeners, logs, effectDisposers }
+}
+
+/**
+ * 调一次 `agent/request-error` 监听器（官方重试正门）。
+ * `next()` 返回一个可辨识的值，用来区分"我们接管了"还是"交回下游"。
+ */
+function runRequestError(listeners, payload) {
+  const handler = (listeners.get('agent/request-error') ?? [])[0]
+  assert.ok(handler, 'agent/request-error 监听器未注册')
+  let nextCalled = 0
+  const returned = handler(payload, () => {
+    nextCalled += 1
+    return Promise.resolve('downstream')
+  })
+  return { returned, nextCalled: () => nextCalled }
+}
+
+/** 等一会儿，用来断定一个 promise"还没有结算"。 */
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
+
+/** 断言一个 promise 仍处于 pending（比直接 await 更难被骗过）。 */
+async function stillPending(promise) {
+  const winner = await Promise.race([
+    Promise.resolve(promise).then(() => 'settled', () => 'settled'),
+    sleep(25).then(() => 'pending'),
+  ])
+  return winner === 'pending'
 }
 
 /** 调用已注册的 llm/stream 监听器，返回 { blocked, nextCalled, chunks }。 */
@@ -120,6 +147,7 @@ test('插件契约与路由注册', () => {
       '/api/peak-brief.allow',
       '/api/peak-brief.allow-off',
       '/api/peak-brief.brief',
+      '/api/peak-brief.cancel-queue',
       '/api/peak-brief.debug-clock',
       '/api/peak-brief.debug-tick',
       '/api/peak-brief.dismiss',
@@ -129,8 +157,9 @@ test('插件契约与路由注册', () => {
     ],
   )
   assert.equal((listeners.get('llm/stream') ?? []).length, 1)
+  assert.equal((listeners.get('agent/request-error') ?? []).length, 1, 'P6：必须挂上官方重试正门')
   assert.equal(logs.length, 1)
-  assert.match(logs[0], /已挂载（P5\+设置界面）/)
+  assert.match(logs[0], /已挂载（P6\+谷期续跑）/)
 })
 
 test('集成：普通工作日 08:50 进入 lead，09:00 进入 peak', async () => {
@@ -245,13 +274,13 @@ test('集成：挂载横幅带出真实相位与日历判定', async () => {
   assert.match(notice.text, /相位 (off|lead|peak)/)
   assert.match(notice.text, /下次切换：/)
   assert.match(notice.text, /门控：/)
-  assert.equal(res.json.state.phase, 'P5+设置界面')
+  assert.equal(res.json.state.phase, 'P6+谷期续跑')
   assert.equal(typeof res.json.state.build, 'string')
 })
 
 test('集成：dispose 后路由全部注销', () => {
   const { routes, effectDisposers } = boot({})
-  assert.equal(routes.size, 9)
+  assert.equal(routes.size, 10)
   for (const teardown of effectDisposers) teardown()
   assert.equal(routes.size, 0)
 })
@@ -1029,11 +1058,13 @@ test('设置：注册 peak-brief 命名空间，并把 patch 配置作为 base �
 
 test('设置：写入后**即时生效**（无需重启）', async () => {
   const settings = makeSettings()
-  const { routes, listeners } = boot({}, { settings })
+  // 显式把 TODAY 覆盖成 off 再断言"写入前是闲时"：否则这条测试会依赖
+  // 跑测试的那一天恰好不是工作日（机器时钟一走，它就会红——踩过）。
+  const { routes, listeners } = boot({ overrides: { [TODAY]: 'off' } }, { settings })
 
   const before = await statusAt(routes, `${TODAY}T10:00:00`)
   assert.equal(before.enabled, false)
-  assert.equal(before.phase, 'off', 'TODAY 未覆盖成峰谷日时不该处于高峰')
+  assert.equal(before.phase, 'off', 'TODAY 覆盖成 off 时不该处于高峰')
 
   // 通过设置页打开开关，并把 TODAY 覆盖成全天高峰
   settings.registrations.get('peak-brief').setUser({
@@ -1320,6 +1351,276 @@ test('P4：没有活跃任务时，定时器零动作、不花一分钱', async 
 
     const off = await tick(routes, `${TODAY}T12:00:00+08:00`)
     assert.deepEqual(off.json.tick.actions, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ------------------------------------------- P6：被拦对话在谷期原地重发
+
+/** P6 用的配置：今天按峰谷算，高峰 09:00-12:00。 */
+function parkConfig(dir, extra = {}) {
+  return {
+    enabled: true,
+    gateMode: 'hard',
+    overrides: { [TODAY]: 'peak' },
+    peakWindows: [['09:00', '12:00']],
+    brief: { dir },
+    ...extra,
+  }
+}
+
+/** 把插件的时钟放进高峰，并拦下一次带 sessionId 的普通对话请求。 */
+async function parkOne(routes, listeners, sessionId, extraOptions = {}) {
+  await call(routes, '/api/peak-brief.debug-clock', {
+    method: 'POST',
+    body: { at: `${TODAY}T10:00:00+08:00` },
+  })
+  return runStreamListener(listeners, {
+    provider: 'p',
+    model: 'm',
+    sessionId,
+    messages: [{ role: 'user', content: [{ type: 'text', text: '继续把插件做完' }] }],
+    ...extraOptions,
+  })
+}
+
+test('P6：高峰拦下的对话请求会 park（不是直接失败），提示说清"推迟到谷期"', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    const blocked = await parkOne(routes, listeners, 'sess-1')
+
+    assert.equal(blocked.nextCalled, 0, '高峰必须真的拦下')
+    assert.equal(blocked.chunks[0].reason.failure.code, GATE_CODE)
+
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 1, '必须登记进 park 队列')
+    assert.equal(state.status.queue.entries[0].sessionId, 'sess-1')
+    assert.match(state.notice.text, /已推迟到谷期/)
+    assert.match(state.notice.text, /自动重发/)
+    assert.match(state.notice.text, /取消推迟/)
+    // 落盘兜底记录存在（重启后靠它续上）
+    assert.equal(existsSync(briefPathFor(dir, 'sess-1')), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：不是我们拦的失败、或没有 park 的会话，一律交回下游（绝不吞别人的恢复权）', async () => {
+  const { listeners } = boot({})
+
+  const other = runRequestError(listeners, {
+    agent: { session: { id: 'sess-x' } },
+    failure: { code: 'RATE_LIMIT', message: '限流' },
+  })
+  assert.equal(other.nextCalled(), 1)
+  assert.equal(await other.returned, 'downstream')
+
+  // code 和我们的一模一样，但没有对应的 park（例如 resumeBlocked 关掉、或重启后内存里没有）
+  const noPark = runRequestError(listeners, {
+    agent: { session: { id: 'sess-unknown' } },
+    failure: { code: GATE_CODE, message: '高峰' },
+  })
+  assert.equal(noPark.nextCalled(), 1)
+  assert.equal(await noPark.returned, 'downstream')
+})
+
+test('P6：谷期一到，等待中的请求原地重发（{ kind: retry }），并且真的放行到下游', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    await parkOne(routes, listeners, 'sess-2')
+
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-2' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+    })
+    assert.equal(await stillPending(gate.returned), true, '还没到谷期，必须挂着而不是立刻返回')
+
+    // 时钟推进到谷期（12:00 之后）——这就是"等到了"的那一刻
+    await call(routes, '/api/peak-brief.debug-clock', {
+      method: 'POST',
+      body: { at: `${TODAY}T12:30:00+08:00` },
+    })
+    assert.deepEqual(await gate.returned, { kind: 'retry' }, '必须返回重试，让 loop 重发同一个请求')
+
+    // 重发的那一次真的放行了
+    const retried = await runStreamListener(listeners, {
+      provider: 'p',
+      model: 'm',
+      sessionId: 'sess-2',
+      messages: [],
+    })
+    assert.equal(retried.nextCalled, 1, '谷期的重发必须走到下游适配器')
+    assert.equal(retried.chunks.at(-1).reason.kind, 'stop')
+
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 0, '重发后队列必须清空')
+    assert.equal(state.status.queue.recent.at(-1).outcome, 'allowed')
+    assert.match(state.notice.text, /原地重发/)
+    // 已经自己续上了：兜底记录要删掉，否则重启对账会再续一遍
+    assert.equal(existsSync(briefPathFor(dir, 'sess-2')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：点「立即放行」等价于立刻到谷期——等待中的请求马上重发', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    await parkOne(routes, listeners, 'sess-3')
+
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-3' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+    })
+    assert.equal(await stillPending(gate.returned), true)
+
+    const allowed = await call(routes, '/api/peak-brief.allow', { method: 'POST', body: { minutes: 30 } })
+    assert.deepEqual(allowed.json.resumed, ['sess-3'], '放行必须顺手把等待中的 park 结算掉')
+    assert.deepEqual(await gate.returned, { kind: 'retry' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：点「取消推迟」= 这次算了：等待以拦截结束，兜底记录一并删除', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    await parkOne(routes, listeners, 'sess-4')
+
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-4' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+    })
+    assert.equal(await stillPending(gate.returned), true)
+
+    const cancelled = await call(routes, '/api/peak-brief.cancel-queue', { method: 'POST', body: {} })
+    assert.deepEqual(cancelled.json.cancelled, ['sess-4'])
+    assert.equal(await gate.returned, undefined, '取消推迟必须让轮次以拦截结束')
+    assert.equal(cancelled.json.queue.count, 0)
+    assert.equal(existsSync(briefPathFor(dir, 'sess-4')), false, '用户放弃了，就不该在重启后被续上')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：用户按"停止"（turn signal abort）必须能立刻收场，而不是干等', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    await parkOne(routes, listeners, 'sess-5')
+
+    const controller = new AbortController()
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-5' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+      signal: controller.signal,
+    })
+    assert.equal(await stillPending(gate.returned), true)
+
+    controller.abort()
+    assert.equal(await gate.returned, undefined, 'abort 后必须立刻结算为终态')
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 0)
+    assert.equal(state.status.queue.recent.at(-1).outcome, 'aborted')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：插件卸载必须结算所有等待（否则会把 dsh-llm-retry 的卸载一起挂住）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners, effectDisposers } = boot(parkConfig(dir))
+    await parkOne(routes, listeners, 'sess-6')
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-6' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+    })
+    assert.equal(await stillPending(gate.returned), true)
+
+    for (const teardown of effectDisposers) teardown()
+    assert.equal(await gate.returned, undefined, 'dispose 后等待必须结算')
+    // 落盘记录**保留**：那正是重启后继续的凭据
+    assert.equal(existsSync(briefPathFor(dir, 'sess-6')), true, '进程没了不算用户放弃，兜底记录要留着')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：关掉 resumeBlocked 就回到 P2 行为（拦下即失败，不进队列）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir, { resumeBlocked: false }))
+    const blocked = await parkOne(routes, listeners, 'sess-7')
+    assert.equal(blocked.chunks[0].reason.failure.code, GATE_CODE)
+
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 0, '关掉之后不该进队列')
+    assert.match(state.notice.text, /peak-allow/, '提示要退回"用 /peak-allow 放行"')
+
+    const gate = runRequestError(listeners, {
+      agent: { session: { id: 'sess-7' } },
+      failure: { code: GATE_CODE, message: '高峰' },
+    })
+    assert.equal(await gate.returned, 'downstream', '没有 park，就该交回下游按终态处理')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：辅助请求（起标题/压缩）永远不 park——挂 3 小时没有意义', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    const { routes, listeners } = boot(parkConfig(dir))
+    const blocked = await parkOne(routes, listeners, 'sess-8', { purpose: 'session-title' })
+    assert.equal(blocked.chunks[0].reason.failure.code, GATE_CODE, '该拦还是要拦')
+
+    const state = (await call(routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 0, '辅助请求不进队列')
+    assert.equal(existsSync(briefPathFor(dir, 'sess-8')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('P6：重启兜底——park 落盘的文件会被对账认领，并在谷期走既有链路继续', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-park-'))
+  try {
+    // 第一个实例：高峰拦下 → 落盘
+    const first = boot(parkConfig(dir))
+    await parkOne(first.routes, first.listeners, 'sess-9')
+    assert.equal(existsSync(briefPathFor(dir, 'sess-9')), true)
+
+    // 第二个实例（模拟重启）：内存里的等待没了，只剩磁盘记录
+    const second = boot(parkConfig(dir))
+    const agent = {
+      session: { id: 'sess-9', deriveMessages: () => [] },
+      inject() {},
+      followup() { agent.followedUp = (agent.followedUp ?? 0) + 1 },
+    }
+    const onCreated = (second.listeners.get('agent/created') ?? [])[0]
+    assert.ok(onCreated, 'agent/created 监听器未注册')
+    onCreated({ agent })
+
+    const state = (await call(second.routes, '/api/peak-brief.state')).json.state
+    assert.equal(state.status.queue.count, 0, '新实例内存里没有 park')
+    assert.equal(state.status.briefs.length, 1, '落盘记录必须被对账认领')
+    assert.equal(state.status.cycles[0].briefed, true)
+    assert.equal(state.status.cycles[0].sessionId, 'sess-9')
+
+    // 谷期：既有恢复链路把简报交回去并续跑
+    const resumed = await call(second.routes, '/api/peak-brief.debug-tick', {
+      method: 'POST',
+      body: { at: `${TODAY}T12:30:00+08:00` },
+    })
+    const action = resumed.json.tick.actions.find((a) => a.sessionId === 'sess-9')
+    assert.equal(action.action, 'resume')
+    assert.equal(action.followedUp, true, '重启丢掉的等待，要在谷期把任务接回来')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

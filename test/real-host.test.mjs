@@ -141,6 +141,7 @@ test('真实宿主：插件在真实 cordis 下装载，apply 真的执行', { s
       '/api/peak-brief.allow',
       '/api/peak-brief.allow-off',
       '/api/peak-brief.brief',
+      '/api/peak-brief.cancel-queue',
       '/api/peak-brief.debug-clock',
       '/api/peak-brief.debug-tick',
       '/api/peak-brief.dismiss',
@@ -154,6 +155,16 @@ test('真实宿主：插件在真实 cordis 下装载，apply 真的执行', { s
   const state = await host.call('/api/peak-brief.state')
   assert.equal(state.json.ok, true)
   assert.equal(state.json.state.plugin, 'dsh-peak-brief')
+
+  // P6：官方重试正门真的挂在**真实 cordis** 上。
+  // 这里不是查内部表，而是直接走一次真实 waterfall：不是我们拦的失败必须原样交回下游，
+  // 绝不能把别人的失败恢复权吞掉。
+  const delegated = await host.ctx.waterfall(
+    'agent/request-error',
+    { agent: { session: { id: 'someone-else' } }, failure: { code: 'SOME_OTHER_CODE', message: 'x' } },
+    () => Promise.resolve('downstream-owns-it'),
+  )
+  assert.equal(delegated, 'downstream-owns-it')
 })
 
 test('真实宿主：未启用时，真实 llm/stream waterfall 放行到适配器', { skip }, async () => {
@@ -204,6 +215,71 @@ test('真实宿主：我们构造的终止 chunk 能被官方 BlockAssembler 正
   assert.equal(assembler.finish.failure.code, 'PEAK_BRIEF_BLOCKED')
   assert.deepEqual(assembler.blocks(), [], '被拦截的请求不该产出任何内容块')
   assert.equal(host.adapter.calls, 0)
+})
+
+/**
+ * P6 的端到端：**真实的 cordis waterfall** + **真实的 LlmRuntime**。
+ *
+ * dsh-agent-loop 里那一步是 `await dispatch.waterfall("agent/request-error", …, () => undefined)`，
+ * 拿到 `{ kind: 'retry' }` 就 `continue` 重发。这里用真实的 `ctx.waterfall` 复现同一件事：
+ * 被拦的请求 park 住 → 谷期一到返回 retry → 重发真的走到适配器。
+ * （loop 本身不在这里构造：那需要 session/projection/tools 一整套；而它对我们唯一的
+ * 契约就是"await waterfall，retry 就重发"，这一点已在源码里逐行核对。）
+ */
+test('真实宿主：被拦请求 park 到谷期，返回 retry 后重发真的抵达适配器', { skip }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'peak-real-park-'))
+  try {
+    const sessionId = 'session-p6'
+    const host = await buildHost({
+      enabled: true,
+      gateMode: 'hard',
+      overrides: { [TODAY]: 'peak' },
+      peakWindows: [['09:00', '12:00']],
+      brief: { dir },
+    })
+    const at = (hms) => `${TODAY}T${hms}+08:00`
+
+    // 时钟放进高峰，拦下一次带 sessionId 的真实请求
+    await host.call('/api/peak-brief.debug-clock', { method: 'POST', body: { at: at('10:00:00') } })
+    const blocked = []
+    for await (const chunk of host.runtime.stream({
+      provider: 'stub-provider', model: 'stub-model', sessionId, messages: MESSAGES,
+    })) blocked.push(chunk)
+    assert.equal(blocked.at(-1).reason.failure.code, 'PEAK_BRIEF_BLOCKED')
+    assert.equal(host.adapter.calls, 0)
+
+    const queued = await host.call('/api/peak-brief.state')
+    assert.equal(queued.json.state.status.queue.count, 1, '真实宿主上也要 park 住')
+
+    // 真实的 agent/request-error waterfall：我们接管，交回一个尚未结算的 promise
+    let settled = false
+    const decision = host.ctx.waterfall(
+      'agent/request-error',
+      { agent: { session: { id: sessionId } }, failure: { code: 'PEAK_BRIEF_BLOCKED', message: '高峰' } },
+      () => Promise.resolve('downstream'),
+    )
+    decision.then(() => { settled = true })
+    await new Promise((resolve) => { setTimeout(resolve, 25) })
+    assert.equal(settled, false, '没到谷期就该挂着，而不是立刻给出结论')
+
+    // 谷期一到 → retry
+    await host.call('/api/peak-brief.debug-clock', { method: 'POST', body: { at: at('12:30:00') } })
+    assert.deepEqual(await decision, { kind: 'retry' })
+
+    // 重发：这一次真的抵达适配器
+    const after = []
+    for await (const chunk of host.runtime.stream({
+      provider: 'stub-provider', model: 'stub-model', sessionId, messages: MESSAGES,
+    })) after.push(chunk)
+    assert.equal(host.adapter.calls, 1, '谷期重发必须真的打到适配器')
+    assert.equal(after.at(-1).reason.kind, 'stop')
+
+    const final = await host.call('/api/peak-brief.state')
+    assert.equal(final.json.state.status.queue.count, 0)
+    assert.equal(final.json.state.status.queue.recent.at(-1).outcome, 'allowed')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('真实宿主：逃生放行后，请求真的抵达适配器', { skip }, async () => {
@@ -262,7 +338,7 @@ test('真实宿主：插件卸载后路由与 waterfall 监听一并拆除', { s
     overrides: { [TODAY]: 'peak' },
     peakWindows: [['00:00', '24:00']],
   })
-  assert.equal(host.routes.size, 9)
+  assert.equal(host.routes.size, 10)
   assert.equal((await host.stream()).at(-1).reason.kind, 'error')
 
   assert.equal(typeof host.fork?.dispose, 'function', 'cordis 的 fork 应当可卸载')

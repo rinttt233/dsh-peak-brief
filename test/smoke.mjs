@@ -97,6 +97,7 @@ assert.deepEqual(
     '/api/peak-brief.allow',
     '/api/peak-brief.allow-off',
     '/api/peak-brief.brief',
+    '/api/peak-brief.cancel-queue',
     '/api/peak-brief.debug-clock',
     '/api/peak-brief.debug-tick',
     '/api/peak-brief.dismiss',
@@ -168,7 +169,7 @@ assert.equal(badAllow.json.error, 'bad_minutes')
 // ---- effect dispose 必须注销全部路由 ----
 const second = makeCtx()
 apply(second.ctx, {})
-assert.equal(second.routes.size, 9)
+assert.equal(second.routes.size, 10)
 for (const teardown of second.effectDisposers) teardown()
 assert.equal(second.routes.size, 0, 'dispose 后路由必须全部注销')
 
