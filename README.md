@@ -1,5 +1,7 @@
 # 本项目代码部分全部由AI完成
 Jvavscpppt(doge)我不会，我只会C++
+# 悲报
+本项目无限期搁置，该项目功能已被官方harness正式版取代
 
 # dsh-peak-brief
 
